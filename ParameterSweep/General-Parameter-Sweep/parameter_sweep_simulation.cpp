@@ -15,7 +15,7 @@
 static const double ABS_EXT_TOL = 1e-6;    // Extinction threshold
 static const double CONSTANT_FACTOR = 0.15;
 static const int    NUM_TRAITS = 50;       // Number of virulence traits
-static const int    EVOL_STEPS = 1500;     // Evolutionary steps
+static const int    EVOL_STEPS = 1000;     // Evolutionary steps
 static const double TSPAN = 200.0;         // Integrate from t=0 to t=200 each step
 static const double DT    = 1.0;           // Integration step size for integrate_adaptive
 

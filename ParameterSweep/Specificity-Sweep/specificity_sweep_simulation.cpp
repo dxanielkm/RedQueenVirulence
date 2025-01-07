@@ -16,7 +16,7 @@
 double abs_ext_tol = 1e-6;  // Absolute extinction threshold
 double constantFactor = 0.15;  // Adjusted to match previous code
 int numTraits = 50;  // Adjust as necessary for performance
-int evolSteps = 1500;
+int evolSteps = 1000;
 
 // Define the state type
 typedef std::vector<double> state_type;
