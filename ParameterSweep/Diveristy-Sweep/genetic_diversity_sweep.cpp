@@ -420,6 +420,24 @@ int main()
                         << de_rand << ","
                         << average_virulence 
                         << "\n";
+
+                    // -----------------------
+                    // Print progress message
+                    // -----------------------
+#pragma omp critical
+                    {
+                        // Each time we finish one (s, N) run in r-th random set:
+                        std::cout << "[Thread " << omp_get_thread_num() 
+                                  << "] Completed Simulation for RandomSet#" << r
+                                  << " with s=" << s_val 
+                                  << ", N=" << N_val
+                                  << ", b=" << b_rand
+                                  << ", gamma=" << ga_rand
+                                  << ", theta=" << th_rand
+                                  << ", delta=" << de_rand
+                                  << " => Avg. Virulence: " << average_virulence
+                                  << "\n";
+                    }
                 }
             }
         } // end for (r)
