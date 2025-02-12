@@ -10,401 +10,405 @@
 #include <omp.h>  // For parallelization
 
 // Compile with:
-// g++-14 -std=c++14 -O2 -I /opt/homebrew/include -fopenmp -o specificitySim specificitySim.cpp
+// g++ -std=c++14 -O2 -I /path/to/boost -fopenmp -o specificitySim specificity_sweep_simulation.cpp
 
-// Define parameters
-double abs_ext_tol = 1e-6;  // Absolute extinction threshold
-double constantFactor = 0.15;  // Adjusted to match previous code
-int numTraits = 50;  // Adjust as necessary for performance
-int evolSteps = 1000;
+// Global settings
+double abs_ext_tol = 1e-6;  
+double constantFactor = 10.0;  // Scale for host populations
+int numTraits = 50;            // Number of discrete virulence trait classes
+int evolSteps = 1000;          // Number of evolutionary time steps
 
-// Define the state type
+int nAlleles = 5;  // For example, set to 3 (you can change it to 2, 3, 4, etc.)
+
+// Each trait block has a size: (nAlleles*nAlleles infected compartments) + (nAlleles parasite compartments)
+int blockSize() {
+    return nAlleles * nAlleles + nAlleles;
+}
+
 typedef std::vector<double> state_type;
 
-// Define the infection matrix Q as a function of specificity parameter s
-auto create_infection_matrix = [](double s) {
-    return std::vector<std::vector<double>>{
-        { (1 + s), (1 - s) },
-        { (1 - s), (1 + s) }
-    };
-};
+// Create an nAlleles x nAlleles infection specificity matrix Q.
+// Q[i][j] = (1 + (nAlleles - 1)*s) / nAlleles if i == j,
+//           (1 - s) / nAlleles if i != j.
+std::vector<std::vector<double>> create_infection_matrix(int nAlleles, double s) {
+    std::vector<std::vector<double>> Q(nAlleles, std::vector<double>(nAlleles, 0.0));
+    for (int i = 0; i < nAlleles; i++){
+        for (int j = 0; j < nAlleles; j++){
+            if (i == j)
+                Q[i][j] = (1 + (nAlleles - 1) * s) / double(nAlleles);
+            else
+                Q[i][j] = (1 - s) / double(nAlleles);
+        }
+    }
+    return Q;
+}
 
-// Define the system of differential equations
+// ODE system for host-parasite dynamics with virulence evolution.
+// The state vector is organized as follows:
+// [S[0], S[1], ..., S[nAlleles-1],
+//  then for each trait k = 0,..., numTraits-1:
+//      Infected hosts: I_{ij} for i=0,..., nAlleles-1 and j=0,..., nAlleles-1,
+//      Free parasites: P_j for j=0,..., nAlleles-1 ]
 struct alleleDynamics {
+    int nAlleles;
     int numTraits;
-    const std::vector<double>& myAlpha;
-    double s;       // Specificity parameter
-    double b;       // Birth rate
-    double gamma;   // Recovery rate
-    double theta;   // Parasite production rate
-    double delta;   // Parasite mortality rate
-    double d;       // Death rate
-    double q;       // Density dependence
+    const std::vector<double>& myAlpha;  // Virulence trait values for each trait class.
+    double s;       // Specificity parameter.
+    double b;       // Intrinsic birth rate.
+    double gamma;   // Recovery rate.
+    double theta;   // theta_tilde (used in the trade-off: theta_k = theta * sqrt(alpha)).
+    double delta;   // Parasite decay rate.
+    double d;       // Natural mortality.
+    double q;       // Density-dependence coefficient.
+    double beta;    // Infection rate (beta = beta0 * nAlleles).
 
-    alleleDynamics(int numTraits, const std::vector<double>& myAlpha, double s,
-                   double b, double gamma, double theta, double delta, double d, double q)
-        : numTraits(numTraits), myAlpha(myAlpha), s(s),
-          b(b), gamma(gamma), theta(theta), delta(delta), d(d), q(q) {}
+    alleleDynamics(int nAlleles, int numTraits, const std::vector<double>& myAlpha, double s,
+                   double b, double gamma, double theta, double delta, double d, double q, double beta)
+        : nAlleles(nAlleles), numTraits(numTraits), myAlpha(myAlpha), s(s),
+          b(b), gamma(gamma), theta(theta), delta(delta), d(d), q(q), beta(beta) {}
 
     void operator()(const state_type& y, state_type& dydt, const double /* t */) const {
-        // First two elements are S1, S2
-        double S1 = y[0];
-        double S2 = y[1];
-
-        // Calculate total population
-        double totalPopulation = S1 + S2;
-        for (size_t i = 2; i < y.size(); i += 6) {
-            totalPopulation += y[i] + y[i + 1] + y[i + 2] + y[i + 3]; // Add infected populations
+        // Extract susceptibles (first nAlleles entries)
+        std::vector<double> S(nAlleles);
+        for (int i = 0; i < nAlleles; i++){
+            S[i] = y[i];
         }
-
+        
+        // Compute total host population: sum of susceptibles + all infected hosts over all trait blocks.
+        double totalPopulation = 0.0;
+        for (int i = 0; i < nAlleles; i++){
+            totalPopulation += S[i];
+        }
+        int bs = blockSize();
+        for (int k = 0; k < numTraits; k++){
+            int offset = nAlleles + k * bs;
+            // Infected host compartments: indices offset to offset + (nAlleles*nAlleles - 1)
+            for (int idx = 0; idx < nAlleles * nAlleles; idx++){
+                totalPopulation += y[offset + idx];
+            }
+        }
+        
         dydt.resize(y.size());
-
-        // Different terms in equation for dS1/dt, dS2/dt
-        double infectionS1 = 0.0;
-        double infectionS2 = 0.0;
-        double recoveryS1 = 0.0;
-        double recoveryS2 = 0.0;
-
-        // Get the Q matrix for the current specificity level
-        std::vector<std::vector<double>> Q = create_infection_matrix(s);
-
-        // Each iteration represents a new trait
-        for (int i = 0, idx = 2; i < numTraits; ++i, idx += 6) {
-            double I11 = y[idx];
-            double I12 = y[idx + 1];
-            double I21 = y[idx + 2];
-            double I22 = y[idx + 3];
-            double P1  = y[idx + 4];
-            double P2  = y[idx + 5];
-
-            // Trade-off between virulence and infectivity
-            double alpha_sqrt = 20 * sqrt(myAlpha[i] / 10);
-
-            // Compute derivatives using Q
-            double dI11 = Q[0][0] * alpha_sqrt * P1 * S1 - (d + gamma + myAlpha[i]) * I11;
-            double dI12 = Q[0][1] * alpha_sqrt * P2 * S1 - (d + gamma + myAlpha[i]) * I12;
-            double dI21 = Q[1][0] * alpha_sqrt * P1 * S2 - (d + gamma + myAlpha[i]) * I21;
-            double dI22 = Q[1][1] * alpha_sqrt * P2 * S2 - (d + gamma + myAlpha[i]) * I22;
-
-            double dP1 = theta * (I11 + I21) - delta * P1;
-            double dP2 = theta * (I12 + I22) - delta * P2;
-
-            // Accumulate infection and recovery terms
-            infectionS1 += alpha_sqrt * (Q[0][0] * P1 * S1 + Q[0][1] * P2 * S1);
-            infectionS2 += alpha_sqrt * (Q[1][0] * P1 * S2 + Q[1][1] * P2 * S2);
-            recoveryS1  += gamma * (I11 + I12);
-            recoveryS2  += gamma * (I21 + I22);
-
-            // Store derivatives
-            dydt[idx]     = dI11;
-            dydt[idx + 1] = dI12;
-            dydt[idx + 2] = dI21;
-            dydt[idx + 3] = dI22;
-            dydt[idx + 4] = dP1;
-            dydt[idx + 5] = dP2;
+        std::vector<double> infLoss(nAlleles, 0.0);
+        std::vector<double> recGain(nAlleles, 0.0);
+        
+        // Get the specificity matrix Q (nAlleles x nAlleles)
+        std::vector<std::vector<double>> Q = create_infection_matrix(nAlleles, s);
+        
+        // Loop over each virulence trait block.
+        for (int k = 0; k < numTraits; k++){
+            int offset = nAlleles + k * bs;
+            // Compute trait-dependent production: theta_k = theta * sqrt(myAlpha[k])
+            double theta_k = theta * std::sqrt(myAlpha[k]);
+            // Loop over host alleles i and parasite alleles j for infected hosts.
+            for (int i = 0; i < nAlleles; i++){
+                for (int j = 0; j < nAlleles; j++){
+                    int index = offset + i * nAlleles + j; // I_{ij} for trait k.
+                    double I_ij = y[index];
+                    // Parasite compartment for allele j in trait k:
+                    int p_index = offset + nAlleles * nAlleles + j;
+                    double P_j = y[p_index];
+                    
+                    // Infected host dynamics:
+                    // dI_{ij} = beta * Q[i][j] * P_j * S[i] - (d + gamma + myAlpha[k]) * I_{ij}
+                    double dI = beta * Q[i][j] * P_j * S[i] - (d + gamma + myAlpha[k]) * I_ij;
+                    dydt[index] = dI;
+                    
+                    // Accumulate loss and recovery contributions for susceptibles.
+                    infLoss[i] += beta * Q[i][j] * P_j * S[i];
+                    recGain[i]  += gamma * I_ij;
+                }
+            }
+            // Compute free parasite dynamics for trait k.
+            for (int j = 0; j < nAlleles; j++){
+                int p_index = offset + nAlleles * nAlleles + j;
+                double P_j = y[p_index];
+                double sum_I = 0.0;
+                for (int i = 0; i < nAlleles; i++){
+                    int index = offset + i * nAlleles + j;
+                    sum_I += y[index];
+                }
+                // dP_j = theta_k * (sum_{i} I_{ij}) - delta * P_j - [sum_{i} beta * Q[i][j] * S[i]] * P_j.
+                double inf_loss = 0.0;
+                for (int i = 0; i < nAlleles; i++){
+                    inf_loss += beta * Q[i][j] * S[i];
+                }
+                double dP = theta_k * sum_I - delta * P_j - inf_loss * P_j;
+                dydt[p_index] = dP;
+            }
         }
-
-        // Calculate dS1/dt, dS2/dt
-        double dS1 = b * S1 * (1 - q * totalPopulation) - d * S1 - infectionS1 + recoveryS1;
-        double dS2 = b * S2 * (1 - q * totalPopulation) - d * S2 - infectionS2 + recoveryS2;
-
-        dydt[0] = dS1;
-        dydt[1] = dS2;
+        
+        // Susceptible host dynamics for each allele i.
+        for (int i = 0; i < nAlleles; i++){
+            double dS_val = b * S[i] * (1 - q * totalPopulation) - d * S[i] - infLoss[i] + recGain[i];
+            dydt[i] = dS_val;
+        }
     }
 };
 
+////////////////////////
+// Main function
+////////////////////////
 int main() {
-    // Default parameter values
-    double default_b     = 10.0;
-    double default_theta = 10.0;
-    double default_delta = 1.0;
-    double default_gamma = 0.6;
-
-    // Prepare to store the results
-    std::ofstream outputFile("specificity_results.csv");
-
-    // Output file header
+    // --- Set parameter values ---
+    double default_b     = 10.0;    // Intrinsic birth rate.
+    double default_theta = 30.0;    // theta_tilde (scaling factor for production).
+    double default_delta = 0.3;     // Parasite decay rate.
+    double default_gamma = 1.0;     // Recovery rate.
+    // Set beta = beta0 * nAlleles. For example, if beta0 = 1.5 then:
+    double default_beta  = 1.5 * nAlleles;  
+    double default_d     = 1.0;       // Natural mortality.
+    double default_q     = 1.0;       // Density-dependent competition.
+    
+    // --- Prepare output file ---
+    std::ofstream outputFile("specificity_sweep_results_n=5.csv");
     outputFile << "s,MeanAlpha\n";
-
-    // Trait space
+    
+    // --- Define the trait space for virulence evolution ---
+    // Let virulence (alpha) vary from alphaLow to alphaHigh.
     double alphaLow  = 1.0;
-    double alphaHigh = 5.0;
+    double alphaHigh = 4.0;
     std::vector<double> myAlpha(numTraits);
-    for (int i = 0; i < numTraits; ++i) {
+    for (int i = 0; i < numTraits; i++){
         myAlpha[i] = alphaLow + i * (alphaHigh - alphaLow) / (numTraits - 1);
     }
-
-    // Initial values
-    double S1_0   = 0.9  * constantFactor;
-    double S2_0   = 0.8  * constantFactor;
-    double I11_0  = 0.1  * constantFactor;
-    double I12_0  = 0.08 * constantFactor;
-    double I21_0  = 0.065* constantFactor;
-    double I22_0  = 0.095* constantFactor;
-    double P1_0   = 0.1  * constantFactor;
-    double P2_0   = 0.09 * constantFactor;
-
-    // Generate a list of s-values from 0, 0.01, 0.02, ..., 1.00
+    
+    // --- Initial conditions ---
+    // Total state vector size = nAlleles (susceptibles) + numTraits * blockSize().
+    int totalSize = nAlleles + numTraits * blockSize();
+    state_type y0(totalSize, 0.0);
+    
+    // Initialize susceptibles: for example, set each S[i] = 0.85 * constantFactor.
+    for (int i = 0; i < nAlleles; i++){
+        y0[i] = 0.85 * constantFactor;
+    }
+    
+    // For each trait block, seed only the first trait (k = 0) with nonzero infected hosts and parasites.
+    int bs = blockSize();
+    for (int k = 0; k < numTraits; k++){
+        int offset = nAlleles + k * bs;
+        if (k == 0) {
+            // For each combination of host allele i and parasite allele j, set I_{ij} = 0.07 * constantFactor.
+            for (int i = 0; i < nAlleles; i++){
+                for (int j = 0; j < nAlleles; j++){
+                    int index = offset + i * nAlleles + j;
+                    y0[index] = 0.07 * constantFactor;
+                }
+            }
+            // For each parasite allele j, set free parasite P_j = 0.1 * constantFactor.
+            for (int j = 0; j < nAlleles; j++){
+                int p_index = offset + nAlleles * nAlleles + j;
+                y0[p_index] = 0.1 * constantFactor;
+            }
+        } else {
+            // For all other traits, set the block to 0.
+            for (int idx = offset; idx < offset + bs; idx++){
+                y0[idx] = 0.0;
+            }
+        }
+    }
+    
+    double t_start = 0.0;
+    double t_end   = 2000.0;
+    
+    // --- Define the range and number of s-values ---
+    double s_min = 0.0;
+    double s_max = 1.0;
+    int num_s_values = 21;  // Adjust as desired.
     std::vector<double> s_values;
-
-    // This loop gives 101 points total from 0 to 1 in increments of 0.01
-    for (int i = 0; i <= 100; ++i) {
-        double s_val = i * 0.01;
+    s_values.reserve(num_s_values);
+    for (int i = 0; i < num_s_values; i++){
+        double s_val = s_min + i * ((s_max - s_min) / (num_s_values - 1));
         s_values.push_back(s_val);
     }
-
-    // Use OpenMP for parallelization
+    
+    // --- Parallel evolutionary simulation using OpenMP ---
     #pragma omp parallel for schedule(dynamic)
-    for (size_t idx = 0; idx < s_values.size(); ++idx) {
+    for (size_t idx = 0; idx < s_values.size(); idx++){
         double s_value = s_values[idx];
-
-        // Set parameter values
-        double b     = default_b;
+        double b = default_b;
         double theta = default_theta;
         double delta = default_delta;
         double gamma = default_gamma;
-
-        // Initialize y0 for each simulation
-        state_type y0(2 + 6 * numTraits, 0.0);
-        y0[0] = S1_0;
-        y0[1] = S2_0;
-
-        int idx_y = 2;
-        for (int i = 0; i < numTraits; ++i) {
-            y0[idx_y]     = I11_0;   // I11
-            y0[idx_y + 1] = I12_0;   // I12
-            y0[idx_y + 2] = I21_0;   // I21
-            y0[idx_y + 3] = I22_0;   // I22
-            y0[idx_y + 4] = P1_0;    // P1
-            y0[idx_y + 5] = P2_0;    // P2
-            idx_y += 6;
-        }
-
+        double beta = default_beta;
+        double d = default_d;
+        double q = default_q;
+        
+        // Initialize y for this simulation from y0.
         state_type y = y0;
-
-        // Evolution simulation
-        for (int step = 1; step <= evolSteps; ++step) {
-            // Integrate over tspan = [0.0, 200.0]
+        
+        // Evolution simulation loop.
+        for (int step = 1; step <= evolSteps; step++){
             double t0 = 0.0;
             double t1 = 200.0;
             double dt = 1.0;
-
-            // Use the runge_kutta_dopri5 stepper
+            
             typedef boost::numeric::odeint::runge_kutta_dopri5<state_type> dopri5_stepper;
-
-            // Create a controlled stepper using make_controlled
-            auto stepper = boost::numeric::odeint::make_controlled<dopri5_stepper>(
-                1e-6,   // Absolute error tolerance
-                1e-6    // Relative error tolerance
-            );
-
-            // Integrate the ODE system
+            auto stepper = boost::numeric::odeint::make_controlled<dopri5_stepper>(1e-6, 1e-6);
+            
             boost::numeric::odeint::integrate_adaptive(
                 stepper,
-                alleleDynamics(numTraits, myAlpha, s_value, b, gamma, theta, delta, 1.0, 1.0),
+                alleleDynamics(nAlleles, numTraits, myAlpha, s_value, b, gamma, theta, delta, d, q, beta),
                 y,
                 t0,
                 t1,
                 dt
             );
-
-            // Apply extinction thresholds
-            for (auto& val : y) {
-                if (val < abs_ext_tol) {
-                    val = 0.0;
-                }
+            
+            // Enforce extinction thresholds and non-negativity.
+            for (auto &val : y){
+                if (val < abs_ext_tol) { val = 0.0; }
+                if (val < 0.0) { val = 0.0; }
             }
-
-            // Ensure populations remain non-negative
-            for (auto& val : y) {
-                if (val < 0.0) {
-                    val = 0.0;
-                }
-            }
-
-            // ----------------------- Mutation logic -----------------------
-            // Calculate total infected host populations I_{ik}^{total} and total parasite populations P_{jk}
-            std::vector<double> Iik_total;          // Stores I_{ik}^{total}
-            std::vector<std::pair<int,int>> h_idxs; // (host allele i, trait k)
+            
+            // ---------- Mutation Logic ----------
+            std::vector<double> Iik_total;
+            std::vector<std::pair<int,int>> h_idxs; // (host allele, trait index)
             double total_infected_hosts = 0.0;
-
-            std::vector<double> Pjk_total;          // Stores P_{jk}
-            std::vector<std::pair<int,int>> p_idxs; // (parasite allele j, trait k)
+            std::vector<double> Pjk_total;
+            std::vector<std::pair<int,int>> p_idxs; // (parasite allele, trait index)
             double total_parasites = 0.0;
-
-            // Build up infected host and parasite totals
-            for (int k = 0; k < numTraits; ++k) {
-                int idx2 = 2 + 6 * k;
-
-                // Host allele 1
-                double I1k_total = y[idx2] + y[idx2 + 1];  // I11 + I12
-                if (I1k_total > 0.0) {
-                    Iik_total.push_back(I1k_total);
-                    h_idxs.emplace_back(0, k);
-                    total_infected_hosts += I1k_total;
+            
+            for (int k = 0; k < numTraits; k++){
+                int offset = nAlleles + k * bs;
+                // For each host allele, sum infected hosts (over parasite alleles) for trait k.
+                for (int i = 0; i < nAlleles; i++){
+                    double sumI = 0.0;
+                    for (int j = 0; j < nAlleles; j++){
+                        int index = offset + i * nAlleles + j;
+                        sumI += y[index];
+                    }
+                    if (sumI > 0.0) {
+                        Iik_total.push_back(sumI);
+                        h_idxs.emplace_back(i, k);
+                        total_infected_hosts += sumI;
+                    }
                 }
-
-                // Host allele 2
-                double I2k_total = y[idx2 + 2] + y[idx2 + 3];  // I21 + I22
-                if (I2k_total > 0.0) {
-                    Iik_total.push_back(I2k_total);
-                    h_idxs.emplace_back(1, k);
-                    total_infected_hosts += I2k_total;
-                }
-
-                // Parasite allele 1
-                double P1k = y[idx2 + 4];
-                if (P1k > 0.0) {
-                    Pjk_total.push_back(P1k);
-                    p_idxs.emplace_back(0, k);
-                    total_parasites += P1k;
-                }
-
-                // Parasite allele 2
-                double P2k = y[idx2 + 5];
-                if (P2k > 0.0) {
-                    Pjk_total.push_back(P2k);
-                    p_idxs.emplace_back(1, k);
-                    total_parasites += P2k;
+                // For parasites: for each parasite allele in trait k.
+                for (int j = 0; j < nAlleles; j++){
+                    int p_index = offset + nAlleles * nAlleles + j;
+                    double P_val = y[p_index];
+                    if (P_val > 0.0) {
+                        Pjk_total.push_back(P_val);
+                        p_idxs.emplace_back(j, k);
+                        total_parasites += P_val;
+                    }
                 }
             }
-
-            // If hosts or parasites are extinct, end early
-            if (total_infected_hosts == 0.0 || total_parasites == 0.0) {
+            
+            if (total_infected_hosts == 0.0 || total_parasites == 0.0)
                 break;
-            }
-
-            // Construct CDFs for host and parasite
+            
             std::vector<double> host_cdf(Iik_total.size());
             std::partial_sum(Iik_total.begin(), Iik_total.end(), host_cdf.begin());
-
             std::vector<double> parasite_cdf(Pjk_total.size());
             std::partial_sum(Pjk_total.begin(), Pjk_total.end(), parasite_cdf.begin());
-
-            // Random generator for this thread (mutation picks)
+            
             static thread_local std::mt19937 gen_thread(std::random_device{}());
             static thread_local std::uniform_real_distribution<> dis_thread(0.0, 1.0);
-
-            // --------------- Host mutation ---------------
+            
+            // ---------- Host Mutation ----------
             double r_host = dis_thread(gen_thread) * total_infected_hosts;
             auto host_it = std::upper_bound(host_cdf.begin(), host_cdf.end(), r_host);
-            if (host_it != host_cdf.end()) {
-                size_t host_idx   = std::distance(host_cdf.begin(), host_it);
-                int i_p           = h_idxs[host_idx].first;   // Allele (0 or 1)
-                int k_p           = h_idxs[host_idx].second;  // Trait index (0..numTraits-1)
-
-                // Determine mutant trait
+            if (host_it != host_cdf.end()){
+                size_t host_idx = std::distance(host_cdf.begin(), host_it);
+                int i_p = h_idxs[host_idx].first;   // host allele.
+                int k_p = h_idxs[host_idx].second;    // current trait index.
                 int k_m = k_p;
-                if (k_p == 0) {
+                if (k_p == 0)
                     k_m = 1;
-                } else if (k_p == numTraits - 1) {
+                else if (k_p == numTraits - 1)
                     k_m = k_p - 1;
-                } else {
+                else
                     k_m = (dis_thread(gen_thread) < 0.5) ? (k_p - 1) : (k_p + 1);
-                }
-
-                // Transfer a fraction eta of the parent's infected population
-                double eta   = 0.1;
-                int idx_p    = 2 + 6 * k_p;
-                int idx_m    = 2 + 6 * k_m;
-
-                if (i_p == 0) {  // Host allele 1
-                    double transfer_I11 = y[idx_p];
-                    double transfer_I12 = y[idx_p + 1];
-
-                    double dI11 = transfer_I11 * eta;
-                    double dI12 = transfer_I12 * eta;
-
-                    y[idx_m]     += dI11;
-                    y[idx_m + 1] += dI12;
-
-                    y[idx_p]     -= dI11;
-                    y[idx_p + 1] -= dI12;
-                } else {         // Host allele 2
-                    double transfer_I21 = y[idx_p + 2];
-                    double transfer_I22 = y[idx_p + 3];
-
-                    double dI21 = transfer_I21 * eta;
-                    double dI22 = transfer_I22 * eta;
-
-                    y[idx_m + 2] += dI21;
-                    y[idx_m + 3] += dI22;
-
-                    y[idx_p + 2] -= dI21;
-                    y[idx_p + 3] -= dI22;
+                double eta = 0.1;
+                int idx_p = nAlleles + k_p * bs;
+                int idx_m = nAlleles + k_m * bs;
+                // For host allele i_p, infected compartments are at indices: idx_p + i_p*nAlleles + j.
+                for (int j = 0; j < nAlleles; j++){
+                    int index_p = idx_p + i_p * nAlleles + j;
+                    int index_m = idx_m + i_p * nAlleles + j;
+                    double transfer = y[index_p] * eta;
+                    y[index_m] += transfer;
+                    y[index_p] -= transfer;
                 }
             }
-
-            // --------------- Parasite mutation ---------------
+            
+            // ---------- Parasite Mutation ----------
             double r_parasite = dis_thread(gen_thread) * total_parasites;
             auto parasite_it = std::upper_bound(parasite_cdf.begin(), parasite_cdf.end(), r_parasite);
-            if (parasite_it != parasite_cdf.end()) {
+            if (parasite_it != parasite_cdf.end()){
                 size_t parasite_idx = std::distance(parasite_cdf.begin(), parasite_it);
-                int j_p             = p_idxs[parasite_idx].first;  // Parasite allele (0 or 1)
-                int k_p             = p_idxs[parasite_idx].second; // Trait index
-
-                // Determine mutant trait
+                int j_p = p_idxs[parasite_idx].first;  // parasite allele.
+                int k_p = p_idxs[parasite_idx].second;   // current trait index.
                 int k_m = k_p;
-                if (k_p == 0) {
+                if (k_p == 0)
                     k_m = 1;
-                } else if (k_p == numTraits - 1) {
+                else if (k_p == numTraits - 1)
                     k_m = k_p - 1;
-                } else {
+                else
                     k_m = (dis_thread(gen_thread) < 0.5) ? (k_p - 1) : (k_p + 1);
-                }
-
-                // Transfer a fraction eta of the parent's parasite population
                 double eta = 0.1;
-                int idx_p  = 2 + 6 * k_p;
-                int idx_m  = 2 + 6 * k_m;
-
-                if (j_p == 0) {  // Parasite allele 1
-                    double transfer_P1 = y[idx_p + 4] * eta;
-                    y[idx_m + 4] += transfer_P1;
-                    y[idx_p + 4] -= transfer_P1;
-                } else {         // Parasite allele 2
-                    double transfer_P2 = y[idx_p + 5] * eta;
-                    y[idx_m + 5] += transfer_P2;
-                    y[idx_p + 5] -= transfer_P2;
-                }
+                int idx_p = nAlleles + k_p * bs;
+                int idx_m = nAlleles + k_m * bs;
+                int p_index_p = idx_p + nAlleles * nAlleles + j_p;
+                int p_index_m = idx_m + nAlleles * nAlleles + j_p;
+                double transfer = y[p_index_p] * eta;
+                y[p_index_m] += transfer;
+                y[p_index_p] -= transfer;
             }
-
-            // Check for extinctions
-            for (auto& val : y) {
-                if (val < abs_ext_tol) {
-                    val = 0.0;
-                }
+            
+            for (auto &val : y) {
+                if(val < abs_ext_tol) { val = 0.0; }
+                if(val < 0.0) { val = 0.0; }
             }
-        } // End of evolSteps loop
-
-        // ----------------- After simulation, calculate mean alpha -----------------
+        } // End of evolution steps
+        
+        // ---------- After simulation, compute the weighted mean virulence ----------
         double sumInfectionParasite_Total = 0.0;
-        for (size_t j = 2; j < y.size(); j += 6) {
-            sumInfectionParasite_Total += y[j] + y[j + 1] + y[j + 2] + y[j + 3] + y[j + 4] + y[j + 5];
-        }
-
-        double weighted_mean_alpha = 0.0;
-        // Calculate weighted mean
-        for (int j = 0; j < numTraits; ++j) {
-            int idx2 = 2 + 6 * j;
-            double trait_pop = y[idx2] + y[idx2 + 1] + y[idx2 + 2] + y[idx2 + 3] 
-                               + y[idx2 + 4] + y[idx2 + 5];
-            if (trait_pop > 0 && sumInfectionParasite_Total > 0) {
-                double proportion = trait_pop / sumInfectionParasite_Total;
-                weighted_mean_alpha += myAlpha[j] * proportion;
+        for (int k = 0; k < numTraits; k++){
+            int offset = nAlleles + k * bs;
+            // Sum all infected hosts in trait k.
+            for (int i = 0; i < nAlleles; i++){
+                for (int j = 0; j < nAlleles; j++){
+                    int index = offset + i * nAlleles + j;
+                    sumInfectionParasite_Total += y[index];
+                }
+            }
+            // Sum free parasites in trait k.
+            for (int j = 0; j < nAlleles; j++){
+                int p_index = offset + nAlleles * nAlleles + j;
+                sumInfectionParasite_Total += y[p_index];
             }
         }
-
-        // Output results
+        double weighted_mean_alpha = 0.0;
+        for (int k = 0; k < numTraits; k++){
+            int offset = nAlleles + k * bs;
+            double trait_pop = 0.0;
+            for (int i = 0; i < nAlleles; i++){
+                for (int j = 0; j < nAlleles; j++){
+                    int index = offset + i * nAlleles + j;
+                    trait_pop += y[index];
+                }
+            }
+            for (int j = 0; j < nAlleles; j++){
+                int p_index = offset + nAlleles * nAlleles + j;
+                trait_pop += y[p_index];
+            }
+            if (trait_pop > 0 && sumInfectionParasite_Total > 0){
+                double proportion = trait_pop / sumInfectionParasite_Total;
+                weighted_mean_alpha += myAlpha[k] * proportion;
+            }
+        }
+        
         #pragma omp critical
         {
-            outputFile << s_value << "," << weighted_mean_alpha << "\n";
+            outputFile << s_values[idx] << "," << weighted_mean_alpha << "\n";
         }
-
-        std::cout << "Simulation completed for s=" << s_value
+        std::cout << "Simulation completed for s=" << s_values[idx]
                   << ", mean_alpha=" << weighted_mean_alpha << std::endl;
-    } // End of s_values loop
-
+    } // End s_values loop
+    
     outputFile.close();
     return 0;
 }
