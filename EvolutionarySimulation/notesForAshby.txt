@@ -1,0 +1,23 @@
+- Increasing N tends to increase virulence values
+- Increase tilde tends to widen the gap for branching points
+- As soon as s=1 changes to s=0.9, branching point stops 
+- Maybe evolutionary stability is determined by s? 
+
+Meeting Today
+- Look at raw data
+- Use find peaks function in scipy to see if it was a branching point
+- Be careful for stochasticity 
+- Detecting a branching point
+- Plot it up to 0.9, for the last one s=1.0 show dashed line to the two mean virulence points
+- Solid line up to 0.9, then dashed line that splits up into 2
+- Relationship between infectivitiy alleles (e.g. when n = 5: p1, p2, p3, p4, p5) and the virulence allele (alpha1, alpha2)
+- Run n = 5, s=1.0, tilde=20 but make ECOLOGICAL time longer while keeping EVOLUTIONARY time the same
+- p1, p2, p3, p4, p5 will have different results for different simulations
+- Make 5 different plots for each allele and then see how the virulence behaves for each allele 
+- Make sure there isn't any consistent pattern, if there is there is a bug with my code
+- Check to see if it is one or multiple alleles ending up in that upper virulence value 
+- Another possibility: All 5 alleles could have the branching point 
+- Having cycles could cause virulence to branch 
+- Focus on trying to understand the association between the infectivitiy alleles and the virulence alleles (is it consistent?)
+- Intrinsically no difference 
+- 

@@ -151,18 +151,22 @@ struct SimulationResult {
 ////////////////////////
 int main() {
     // Define the sets of parameter values.
-    std::vector<int> N_values = {2, 3, 5}; // Example values.
-    std::vector<double> thetaTilde_values = {5, 10, 20};  // thetã values.
+    std::vector<int> N_values = {5}; // Example values.
+    std::vector<double> thetaTilde_values = {20};  // thetã values.
     
     // Define the s-values.
-    double s_min = 0.0, s_max = 1.0;
-    int num_s_values = 11;
+    double s_min = 1.0, s_max = 1.0;
+    int num_s_values = 1;
     std::vector<double> s_values;
+    s_values.push_back(1.0);
+    /*
     s_values.reserve(num_s_values);
     for (int i = 0; i < num_s_values; i++){
         double s_val = s_min + i * ((s_max - s_min) / (num_s_values - 1));
         s_values.push_back(s_val);
     }
+    */
+    
     
     // Outer loops: for each (N, thetã) combination, we will produce one CSV file.
     for (int n : N_values) {
@@ -389,7 +393,7 @@ int main() {
             
             // Write results to file.
             std::ostringstream fname;
-            fname << "specificity_sweep_results_N=" << current_nAlleles 
+            fname << "2specificity_sweep_results_N=" << current_nAlleles 
                   << "_theta=" << current_theta << ".csv";
             std::ofstream outputFile(fname.str());
             outputFile << "s,MeanAlpha,replicate\n";
